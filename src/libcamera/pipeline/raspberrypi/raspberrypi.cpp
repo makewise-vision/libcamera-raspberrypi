@@ -226,6 +226,7 @@ public:
 
 	std::unique_ptr<CameraSensor> sensor_;
 	SensorFormats sensorFormats_;
+	std::unique_ptr<V4L2Subdevice> lens_;
 	/* Array of Unicam and ISP device streams and associated buffers/streams. */
 	RPi::Device<Unicam, 2> unicam_;
 	RPi::Device<Isp, 4> isp_;
@@ -245,6 +246,8 @@ public:
 
 	std::unique_ptr<RPi::DelayedControls> delayedCtrls_;
 	bool sensorMetadata_;
+
+	std::unique_ptr<DelayedControls> focusDelayedCtrls_;
 
 	/*
 	 * All the functions in this class are called from a single calling
@@ -303,6 +306,7 @@ private:
 	bool findMatchingBuffers(BayerFrame &bayerFrame, FrameBuffer *&embeddedBuffer);
 
 	unsigned int ispOutputCount_;
+	ControlIdMap idMap_;
 };
 
 class RPiCameraConfiguration : public CameraConfiguration
@@ -1104,7 +1108,8 @@ int PipelineHandlerRPi::start(Camera *camera, const ControlList *controls)
 	 * the IPA.
 	 */
 	data->delayedCtrls_->reset(0);
-
+	if (data->focusDelayedCtrls_)
+		data->focusDelayedCtrls_->reset();
 	data->state_ = RPiCameraData::State::Idle;
 
 	/* Start all streams. */
@@ -1281,6 +1286,23 @@ int PipelineHandlerRPi::registerCamera(MediaDevice *unicam, MediaDevice *isp, Me
 	data->isp_[Isp::Stats].dev()->bufferReady.connect(data.get(), &RPiCameraData::ispOutputDequeue);
 
 	data->sensor_ = std::make_unique<CameraSensor>(sensorEntity);
+
+
+	for (MediaEntity *entity : unicam->entities()) {
+		if (entity->function() == MEDIA_ENT_F_LENS) {
+			data->lens_ = std::make_unique<V4L2Subdevice>(entity);
+			break;
+		}
+	}
+	
+	if (data->lens_) {
+		int ret = data->lens_->open();
+		if (ret < 0) {
+			data->lens_.reset();
+			LOG(RPI, Error) << "Failed to open the lens device.";
+		}
+	}
+
 	if (!data->sensor_)
 		return -EINVAL;
 
@@ -1343,10 +1365,19 @@ int PipelineHandlerRPi::registerCamera(MediaDevice *unicam, MediaDevice *isp, Me
 		{ V4L2_CID_ANALOGUE_GAIN, { result.sensorConfig.gainDelay, false } },
 		{ V4L2_CID_EXPOSURE, { result.sensorConfig.exposureDelay, false } },
 		{ V4L2_CID_HBLANK, { result.sensorConfig.hblankDelay, false } },
-		{ V4L2_CID_VBLANK, { result.sensorConfig.vblankDelay, true } }
+		{ V4L2_CID_VBLANK, { result.sensorConfig.vblankDelay, true } },
+		{ V4L2_CID_FOCUS_ABSOLUTE, { 1, false } }
 	};
 	data->delayedCtrls_ = std::make_unique<RPi::DelayedControls>(data->sensor_->device(), params);
 	data->sensorMetadata_ = result.sensorConfig.sensorMetadata;
+
+	if (data->lens_) {
+		std::unordered_map<uint32_t, DelayedControls::ControlParams> params_focus = {
+			{ V4L2_CID_FOCUS_ABSOLUTE, { 1, false } },
+		};
+		data->focusDelayedCtrls_ = std::make_unique<DelayedControls>(data->lens_.get(), params_focus);
+	}
+
 
 	/* Register initial controls that the Raspberry Pi IPA can handle. */
 	data->controlInfo_ = std::move(result.controlInfo);
@@ -1484,17 +1515,17 @@ int PipelineHandlerRPi::prepareBuffers(Camera *camera)
 			/*
 			 * If an application has configured a RAW stream, allocate
 			 * additional buffers to make up the minimum, but ensure
-			 * we have at least 2 sets of internal buffers to use to
+			 * we have at least 1 sets of internal buffers to use to
 			 * minimise frame drops.
 			 */
-			numBuffers = std::max<int>(2, minBuffers - numRawBuffers);
+			numBuffers = std::max<int>(1, minBuffers - numRawBuffers);
 		} else if (stream == &data->isp_[Isp::Input]) {
 			/*
 			 * ISP input buffers are imported from Unicam, so follow
 			 * similar logic as above to count all the RAW buffers
 			 * available.
 			 */
-			numBuffers = numRawBuffers + std::max<int>(2, minBuffers - numRawBuffers);
+			numBuffers = numRawBuffers + std::max<int>(1, minBuffers - numRawBuffers);
 
 		} else if (stream == &data->unicam_[Unicam::Embedded]) {
 			/*
@@ -1512,6 +1543,7 @@ int PipelineHandlerRPi::prepareBuffers(Camera *camera)
 			numBuffers = 1;
 		}
 
+		LOG(RPI, Debug) << stream->name() << ": number buffers: " << numBuffers;
 		ret = stream->prepareBuffers(numBuffers);
 		if (ret < 0)
 			return ret;
@@ -1574,6 +1606,8 @@ void RPiCameraData::frameStarted(uint32_t sequence)
 
 	/* Write any controls for the next frame as soon as we can. */
 	delayedCtrls_->applyControls(sequence);
+	if (focusDelayedCtrls_)
+		focusDelayedCtrls_->applyControls(sequence);
 }
 
 int RPiCameraData::loadIPA(ipa::RPi::IPAInitResult *result)
@@ -1604,7 +1638,7 @@ int RPiCameraData::loadIPA(ipa::RPi::IPAInitResult *result)
 		configurationFile = std::string(configFromEnv);
 	}
 
-	IPASettings settings(configurationFile, sensor_->model());
+	IPASettings settings(configurationFile,  sensor_->entity()->name());
 
 	return ipa_->init(settings, result);
 }
@@ -1625,7 +1659,23 @@ int RPiCameraData::configureIPA(const CameraConfiguration *config, ipa::RPi::IPA
 		}
 	}
 
-	entityControls.emplace(0, sensor_->controls());
+	ControlInfoMap infoMap = sensor_->controls();
+	if (focusDelayedCtrls_) {
+		const ControlInfoMap focusInfoMap = lens_->controls();
+		ControlInfoMap::Map ctrls;
+		idMap_.clear();
+
+		ctrls.insert(infoMap.begin(), infoMap.end());
+		idMap_.insert(infoMap.idmap().begin(), infoMap.idmap().end());
+
+		ctrls.insert(focusInfoMap.begin(), focusInfoMap.end());
+		idMap_.insert(focusInfoMap.idmap().begin(), focusInfoMap.idmap().end());
+
+		ControlInfoMap controls(std::move(ctrls), idMap_);
+		infoMap = std::move(controls);
+	}
+
+	entityControls.emplace(0, std::move(infoMap));
 	entityControls.emplace(1, isp_[Isp::Input].dev()->controls());
 
 	/* Always send the user transform to the IPA. */
@@ -1839,8 +1889,36 @@ void RPiCameraData::setIspControls(const ControlList &controls)
 
 void RPiCameraData::setDelayedControls(const ControlList &controls, uint32_t delayContext)
 {
-	if (!delayedCtrls_->push(controls, delayContext))
-		LOG(RPI, Error) << "V4L2 DelayedControl set failed";
+	if (focusDelayedCtrls_) {
+		ControlList sensor_ctrls = delayedCtrls_->get(0);
+		ControlList focus_ctrls = focusDelayedCtrls_->get(0);
+
+		int count = 0;
+
+		for (const auto &ctrl : controls) {
+			if (focus_ctrls.contains(ctrl.first)) {
+				focus_ctrls.set(ctrl.first, ctrl.second);
+				count++;
+			}
+		}
+
+		if (count) {
+			if (!focusDelayedCtrls_->push(focus_ctrls))
+				LOG(RPI, Error) << "V4L2 Focus DelayedControl set failed";
+		}
+
+		for (const auto &ctrl : controls) {
+			if (sensor_ctrls.contains(ctrl.first))
+				sensor_ctrls.set(ctrl.first, ctrl.second);
+		}
+
+		if (!delayedCtrls_->push(sensor_ctrls))
+			LOG(RPI, Error) << "V4L2 DelayedControl set failed";
+	} else {
+		if (!delayedCtrls_->push(controls))
+			LOG(RPI, Error) << "V4L2 DelayedControl set failed";
+	}
+
 	handleState();
 }
 
@@ -1912,7 +1990,27 @@ void RPiCameraData::unicamBufferDequeue(FrameBuffer *buffer)
 		 * Lookup the sensor controls used for this frame sequence from
 		 * DelayedControl and queue them along with the frame buffer.
 		 */
-		auto [ctrl, delayContext] = delayedCtrls_->get(buffer->metadata().sequence);
+		ControlList ctrl = delayedCtrls_->get(buffer->metadata().sequence);
+
+		if (focusDelayedCtrls_) {
+			ControlList ctrl_focus = focusDelayedCtrls_->get(buffer->metadata().sequence);
+			ControlInfoMap::Map ctrls;
+			ControlIdMap idMap;
+
+			ctrls.insert(ctrl.infoMap()->begin(), ctrl.infoMap()->end());
+			idMap.insert(ctrl.idMap()->begin(), ctrl.idMap()->end());
+
+			ctrls.insert(ctrl_focus.infoMap()->begin(), ctrl_focus.infoMap()->end());
+			idMap.insert(ctrl_focus.idMap()->begin(), ctrl_focus.idMap()->end());
+
+			ControlInfoMap controls(std::move(ctrls), idMap);
+			ControlList ctrl_merged(controls);
+			ctrl_merged.merge(ctrl);
+			ctrl_merged.merge(ctrl_focus);
+
+			ctrl = ctrl_merged;
+		}
+
 		/*
 		 * Add the frame timestamp to the ControlList for the IPA to use
 		 * as it does not receive the FrameBuffer object.

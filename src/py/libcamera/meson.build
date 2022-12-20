@@ -73,6 +73,8 @@ pycamera_args = [
 ]
 
 destdir = get_option('libdir') / ('python' + py3_dep.version()) / 'site-packages' / 'libcamera'
+#to test layter
+#destdir = 'lib' / 'python3' / 'dist-packages' / 'libcamera'
 
 pycamera = shared_module('_libcamera',
                          pycamera_sources,
