@@ -750,10 +750,112 @@ void UVCCameraData::addControl(uint32_t cid, const ControlInfo &v4l2Info,
 void UVCCameraData::bufferReady(FrameBuffer *buffer)
 {
 	Request *request = buffer->request();
+	ControlList *metadata = &request->metadata();
 
 	/* \todo Use the UVC metadata to calculate a more precise timestamp */
-	request->metadata().set(controls::SensorTimestamp,
-				buffer->metadata().timestamp);
+	metadata->set(controls::SensorTimestamp, buffer->metadata().timestamp);
+
+	/* Retrieve control as reported by the device. */
+	std::vector<uint32_t> ids;
+	for (const auto &[controlId, _] : video_->controls()) {
+		switch (uint32_t cid = controlId->id()) {
+		case V4L2_CID_BRIGHTNESS:
+		case V4L2_CID_CONTRAST:
+		case V4L2_CID_SATURATION:
+		case V4L2_CID_EXPOSURE_AUTO:
+		case V4L2_CID_EXPOSURE_ABSOLUTE:
+		case V4L2_CID_GAIN:
+		case V4L2_CID_FOCUS_ABSOLUTE:
+		case V4L2_CID_FOCUS_AUTO:
+			ids.push_back(cid);
+			break;
+		default:;
+		}
+	}
+
+	/*
+	 * See UVCCameraData::addControl() for explanations of the different
+	 * value mappings.
+	 */
+	ControlList deviceControls = video_->getControls(ids);
+	for (const auto &[cid, value] : deviceControls) {
+		ControlInfo v4l2Info = video_->controls().at(cid);
+
+		int32_t min = -1, def = -1, max = -1;
+		if (v4l2Info.min().type() == ControlTypeInteger32)
+			min = v4l2Info.min().get<int32_t>();
+		if (v4l2Info.min().type() == ControlTypeInteger32)
+			def = v4l2Info.def().get<int32_t>();
+		if (v4l2Info.min().type() == ControlTypeInteger32)
+			max = v4l2Info.max().get<int32_t>();
+
+		switch (cid) {
+		case V4L2_CID_BRIGHTNESS: {
+			float scale = std::max(max - def, def - min);
+
+			float fvalue = (value.get<int32_t>() - def) / scale;
+			metadata->set(controls::Brightness, fvalue);
+			break;
+		}
+
+		case V4L2_CID_GAIN:
+		case V4L2_CID_CONTRAST: {
+			float m = (4.0f - 1.0f) / (max - def);
+			float p = 1.0f - m * def;
+
+			if (m * min + p < 0.5f) {
+				m = (1.0f - 0.5f) / (def - min);
+				p = 1.0f - m * def;
+			}
+
+			float fvalue = m * value.get<int32_t>() + p;
+			if (cid == V4L2_CID_GAIN)
+				metadata->set(controls::AnalogueGain, fvalue);
+			else if (cid == V4L2_CID_CONTRAST)
+				metadata->set(controls::Contrast, fvalue);
+			break;
+		}
+
+		case V4L2_CID_SATURATION: {
+			float scale = def - min;
+
+			float fvalue = (value.get<int32_t>() - min) / scale;
+			metadata->set(controls::Saturation, fvalue);
+			break;
+		}
+
+		case V4L2_CID_EXPOSURE_AUTO: {
+			bool bvalue = value.get<int32_t>() != V4L2_EXPOSURE_MANUAL;
+			metadata->set(controls::AeEnable, bvalue);
+			break;
+		}
+
+		case V4L2_CID_EXPOSURE_ABSOLUTE: {
+			int32_t ivalue = value.get<int32_t>() * 100;
+			metadata->set(controls::ExposureTime, ivalue);
+			break;
+		}
+
+		case V4L2_CID_FOCUS_ABSOLUTE: {
+			float focusedAt50Cm = 0.15f * (max - min);
+			float scale = 2.0f / focusedAt50Cm;
+
+			float fvalue = (value.get<int32_t>() - min) * scale;
+			metadata->set(controls::LensPosition, fvalue);
+			break;
+		}
+
+		case V4L2_CID_FOCUS_AUTO: {
+			uint32_t ivalue = value.get<int32_t>() == 0
+					? controls::AfModeManual
+					: controls::AfModeContinuous;
+			metadata->set(controls::AfMode, ivalue);
+			break;
+		}
+
+		default:;
+		}
+	}
 
 	pipe()->completeBuffer(request, buffer);
 	pipe()->completeRequest(request);
