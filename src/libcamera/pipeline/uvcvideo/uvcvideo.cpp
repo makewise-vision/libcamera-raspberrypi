@@ -304,13 +304,14 @@ int PipelineHandlerUVC::processControl(ControlList *controls, unsigned int id,
 		cid = V4L2_CID_EXPOSURE_ABSOLUTE;
 	else if (id == controls::AnalogueGain)
 		cid = V4L2_CID_GAIN;
+	else if (id == controls::LensPosition && controls->idMap()->count(V4L2_CID_FOCUS_ABSOLUTE)) // Check if device supports this control
+		cid = V4L2_CID_FOCUS_ABSOLUTE;
+	else if (id == controls::AfMode && controls->idMap()->count(V4L2_CID_FOCUS_AUTO)) // Check if device supports this control
+		cid = V4L2_CID_FOCUS_AUTO;
 	else
 		return -EINVAL;
 
 	const ControlInfo &v4l2Info = controls->infoMap()->at(cid);
-	int32_t min = v4l2Info.min().get<int32_t>();
-	int32_t def = v4l2Info.def().get<int32_t>();
-	int32_t max = v4l2Info.max().get<int32_t>();
 
 	/*
 	 * See UVCCameraData::addControl() for explanations of the different
@@ -318,6 +319,10 @@ int PipelineHandlerUVC::processControl(ControlList *controls, unsigned int id,
 	 */
 	switch (cid) {
 	case V4L2_CID_BRIGHTNESS: {
+		int32_t min = v4l2Info.min().get<int32_t>();
+		int32_t def = v4l2Info.def().get<int32_t>();
+		int32_t max = v4l2Info.max().get<int32_t>();
+
 		float scale = std::max(max - def, def - min);
 		float fvalue = value.get<float>() * scale + def;
 		controls->set(cid, static_cast<int32_t>(lroundf(fvalue)));
@@ -325,6 +330,9 @@ int PipelineHandlerUVC::processControl(ControlList *controls, unsigned int id,
 	}
 
 	case V4L2_CID_SATURATION: {
+		int32_t min = v4l2Info.min().get<int32_t>();
+		int32_t def = v4l2Info.def().get<int32_t>();
+
 		float scale = def - min;
 		float fvalue = value.get<float>() * scale + min;
 		controls->set(cid, static_cast<int32_t>(lroundf(fvalue)));
@@ -345,6 +353,10 @@ int PipelineHandlerUVC::processControl(ControlList *controls, unsigned int id,
 
 	case V4L2_CID_CONTRAST:
 	case V4L2_CID_GAIN: {
+		int32_t min = v4l2Info.min().get<int32_t>();
+		int32_t def = v4l2Info.def().get<int32_t>();
+		int32_t max = v4l2Info.max().get<int32_t>();
+
 		float m = (4.0f - 1.0f) / (max - def);
 		float p = 1.0f - m * def;
 
@@ -355,6 +367,22 @@ int PipelineHandlerUVC::processControl(ControlList *controls, unsigned int id,
 
 		float fvalue = (value.get<float>() - p) / m;
 		controls->set(cid, static_cast<int32_t>(lroundf(fvalue)));
+		break;
+	}
+
+	case V4L2_CID_FOCUS_ABSOLUTE: {
+		int32_t min = v4l2Info.min().get<int32_t>();
+		int32_t max = v4l2Info.max().get<int32_t>();
+
+		float focusedAt50Cm = 0.15f * (max - min);
+		float scale = focusedAt50Cm / 2.0f;
+
+		controls->set(cid, static_cast<int>(min + value.get<float>() * scale));
+		break;
+	}
+
+	case V4L2_CID_FOCUS_AUTO: {
+		controls->set(cid, static_cast<int>(value.get<int>() == 0 ? V4L2_FOCUS_MANUAL : V4L2_FOCUS_AUTO));
 		break;
 	}
 
@@ -655,14 +683,17 @@ void UVCCameraData::addControl(uint32_t cid, const ControlInfo &v4l2Info,
 	case V4L2_CID_GAIN:
 		id = &controls::AnalogueGain;
 		break;
+	case V4L2_CID_FOCUS_ABSOLUTE:
+		id = &controls::LensPosition;
+		break;
+	case V4L2_CID_FOCUS_AUTO:
+		id = &controls::AfMode;
+		break;
 	default:
 		return;
 	}
 
 	/* Map the control info. */
-	int32_t min = v4l2Info.min().get<int32_t>();
-	int32_t max = v4l2Info.max().get<int32_t>();
-	int32_t def = v4l2Info.def().get<int32_t>();
 
 	switch (cid) {
 	case V4L2_CID_BRIGHTNESS: {
@@ -673,6 +704,9 @@ void UVCCameraData::addControl(uint32_t cid, const ControlInfo &v4l2Info,
 		 * Accommodate this by restricting the range of the libcamera
 		 * control, but always within the maximum limits.
 		 */
+		int32_t min = v4l2Info.min().get<int32_t>();
+		int32_t max = v4l2Info.max().get<int32_t>();
+		int32_t def = v4l2Info.def().get<int32_t>();
 		float scale = std::max(max - def, def - min);
 
 		info = ControlInfo{
@@ -683,36 +717,42 @@ void UVCCameraData::addControl(uint32_t cid, const ControlInfo &v4l2Info,
 		break;
 	}
 
-	case V4L2_CID_SATURATION:
+	case V4L2_CID_SATURATION: {
 		/*
 		 * The Saturation control is a float, with 0.0 mapped to the
 		 * minimum value (corresponding to a fully desaturated image)
 		 * and 1.0 mapped to the default value. Calculate the maximum
 		 * value accordingly.
 		 */
+		int32_t min = v4l2Info.min().get<int32_t>();
+		int32_t max = v4l2Info.max().get<int32_t>();
+		int32_t def = v4l2Info.def().get<int32_t>();
 		info = ControlInfo{
 			{ 0.0f },
 			{ static_cast<float>(max - min) / (def - min) },
 			{ 1.0f }
 		};
 		break;
-
+	}
 	case V4L2_CID_EXPOSURE_AUTO:
 		info = ControlInfo{ false, true, true };
 		break;
 
-	case V4L2_CID_EXPOSURE_ABSOLUTE:
+	case V4L2_CID_EXPOSURE_ABSOLUTE: {
 		/*
 		 * ExposureTime is in units of 1 µs, and UVC expects
 		 * V4L2_CID_EXPOSURE_ABSOLUTE in units of 100 µs.
 		 */
+		int32_t min = v4l2Info.min().get<int32_t>();
+		int32_t max = v4l2Info.max().get<int32_t>();
+		int32_t def = v4l2Info.def().get<int32_t>();
 		info = ControlInfo{
 			{ min * 100 },
 			{ max * 100 },
 			{ def * 100 }
 		};
 		break;
-
+	}
 	case V4L2_CID_CONTRAST:
 	case V4L2_CID_GAIN: {
 		/*
@@ -723,6 +763,9 @@ void UVCCameraData::addControl(uint32_t cid, const ControlInfo &v4l2Info,
 		 * maximum values are respectively no lower than 0.5 and no
 		 * higher than 4.0.
 		 */
+		int32_t min = v4l2Info.min().get<int32_t>();
+		int32_t max = v4l2Info.max().get<int32_t>();
+		int32_t def = v4l2Info.def().get<int32_t>();
 		float m = (4.0f - 1.0f) / (max - def);
 		float p = 1.0f - m * def;
 
@@ -735,6 +778,31 @@ void UVCCameraData::addControl(uint32_t cid, const ControlInfo &v4l2Info,
 			{ m * min + p },
 			{ m * max + p },
 			{ 1.0f }
+		};
+		break;
+	}
+	case V4L2_CID_FOCUS_ABSOLUTE: {
+		int32_t min = v4l2Info.min().get<int32_t>();
+		int32_t max = v4l2Info.max().get<int32_t>();
+		int32_t def = v4l2Info.def().get<int32_t>();
+
+		float focusedAt50Cm = 0.15f * (max - min);
+		float scale = 2.0f / focusedAt50Cm;
+
+		info = ControlInfo{
+			{ 0.0f },
+			{ scale * (max - min) },
+			{ scale * (def - min) }
+		};
+		break;
+	}
+	case V4L2_CID_FOCUS_AUTO: {
+		bool def = v4l2Info.def().get<bool>();
+
+		info = ControlInfo{
+			{ static_cast<int>(V4L2_FOCUS_MANUAL) },
+			{ static_cast<int>(V4L2_FOCUS_AUTO) },
+			{ static_cast<int>(def ? V4L2_FOCUS_AUTO : V4L2_FOCUS_MANUAL) },
 		};
 		break;
 	}
