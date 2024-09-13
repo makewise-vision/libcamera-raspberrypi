@@ -304,13 +304,26 @@ int PipelineHandlerUVC::processControl(ControlList *controls, unsigned int id,
 		cid = V4L2_CID_EXPOSURE_ABSOLUTE;
 	else if (id == controls::AnalogueGain)
 		cid = V4L2_CID_GAIN;
+	else if (id == controls::LensPosition)
+		cid = V4L2_CID_FOCUS_ABSOLUTE;
+	else if (id == controls::AfMode)
+		cid = V4L2_CID_FOCUS_AUTO;
 	else
 		return -EINVAL;
 
+	/* Check if the device supports this control. */
+	if (controls->idMap()->find(cid) == controls->idMap()->end())
+		return -EINVAL;
+
 	const ControlInfo &v4l2Info = controls->infoMap()->at(cid);
-	int32_t min = v4l2Info.min().get<int32_t>();
-	int32_t def = v4l2Info.def().get<int32_t>();
-	int32_t max = v4l2Info.max().get<int32_t>();
+
+	int32_t min = -1, def = -1, max = -1;
+	if (v4l2Info.min().type() == ControlTypeInteger32)
+		min = v4l2Info.min().get<int32_t>();
+	if (v4l2Info.min().type() == ControlTypeInteger32)
+		def = v4l2Info.def().get<int32_t>();
+	if (v4l2Info.min().type() == ControlTypeInteger32)
+		max = v4l2Info.max().get<int32_t>();
 
 	/*
 	 * See UVCCameraData::addControl() for explanations of the different
@@ -355,6 +368,21 @@ int PipelineHandlerUVC::processControl(ControlList *controls, unsigned int id,
 
 		float fvalue = (value.get<float>() - p) / m;
 		controls->set(cid, static_cast<int32_t>(lroundf(fvalue)));
+		break;
+	}
+
+	case V4L2_CID_FOCUS_ABSOLUTE: {
+		float focusedAt50Cm = 0.15f * (max - min);
+		float scale = focusedAt50Cm / 2.0f;
+
+		float fvalue = value.get<float>() * scale + min;
+		controls->set(cid, static_cast<int32_t>(lroundf(fvalue)));
+		break;
+	}
+
+	case V4L2_CID_FOCUS_AUTO: {
+		int32_t ivalue = value.get<int32_t>() != controls::AfModeManual;
+		controls->set(cid, ivalue);
 		break;
 	}
 
@@ -655,14 +683,32 @@ void UVCCameraData::addControl(uint32_t cid, const ControlInfo &v4l2Info,
 	case V4L2_CID_GAIN:
 		id = &controls::AnalogueGain;
 		break;
+	case V4L2_CID_FOCUS_ABSOLUTE:
+		id = &controls::LensPosition;
+		break;
+	case V4L2_CID_FOCUS_AUTO:
+		id = &controls::AfMode;
+		break;
 	default:
 		return;
 	}
 
 	/* Map the control info. */
-	int32_t min = v4l2Info.min().get<int32_t>();
-	int32_t max = v4l2Info.max().get<int32_t>();
-	int32_t def = v4l2Info.def().get<int32_t>();
+	int32_t min = -1, def = -1, max = -1;
+	if (v4l2Info.min().type() == ControlTypeInteger32)
+		min = v4l2Info.min().get<int32_t>();
+	else if (v4l2Info.min().type() == ControlTypeBool)
+		min = v4l2Info.min().get<bool>();
+
+	if (v4l2Info.def().type() == ControlTypeInteger32)
+		def = v4l2Info.def().get<int32_t>();
+	else if (v4l2Info.def().type() == ControlTypeBool)
+		def = v4l2Info.def().get<bool>();
+
+	if (v4l2Info.max().type() == ControlTypeInteger32)
+		max = v4l2Info.max().get<int32_t>();
+	else if (v4l2Info.max().type() == ControlTypeBool)
+		max = v4l2Info.max().get<bool>();
 
 	switch (cid) {
 	case V4L2_CID_BRIGHTNESS: {
@@ -735,6 +781,45 @@ void UVCCameraData::addControl(uint32_t cid, const ControlInfo &v4l2Info,
 			{ m * min + p },
 			{ m * max + p },
 			{ 1.0f }
+		};
+		break;
+	}
+	case V4L2_CID_FOCUS_ABSOLUTE: {
+		/*
+		 * LensPosition expects values to be in the range of
+		 * [0.0f, maxDioptres], while a value of 0 means focused to
+		 * infinity, 0.5 means focused at 2m, 2 means focused at 50cm
+		 * and maxDioptres will be the closest possible focus which
+		 * will equate to a focus distance of (1 / maxDioptres) metres.
+		 *
+		 * \todo These values will definitely vary for each different
+		 * hardware, so this should be tunable somehow. In this case
+		 * 0.15f (~= 150 / (1023 - 1)) was a value read from
+		 * V4L2_CID_FOCUS_ABSOLUTE control when using a random camera
+		 * and having it autofocus at a distance of about 50cm.
+		 * This means the minimum focus distance of this camera should
+		 * be 75mm (0.15 / 2) which equals a maxDioptres value of ~=
+		 * 13.3333 (2 / 0.15). Also, the values might not scale
+		 * linearly, but this implementation assumes they do.
+		 */
+		float focusedAt50Cm = 0.15f * (max - min);
+		float scale = 2.0f / focusedAt50Cm;
+
+		info = ControlInfo{
+			{ 0.0f },
+			{ (max - min) * scale },
+			{ (def - min) * scale }
+		};
+		break;
+	}
+	case V4L2_CID_FOCUS_AUTO: {
+		int32_t manual = controls::AfModeManual;
+		int32_t continuous = controls::AfModeContinuous;
+
+		info = ControlInfo{
+			{ manual },
+			{ continuous },
+			{ def ? continuous : manual },
 		};
 		break;
 	}
